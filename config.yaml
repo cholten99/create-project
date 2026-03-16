@@ -1,0 +1,8 @@
+local_dev_root: /home/david-durant/Dev
+
+remote_web_root: /var/www
+apache_sites_path: /etc/apache2/sites-available
+
+certbot_email: dave@bowsy.co.uk
+
+cloudflare_proxy: true

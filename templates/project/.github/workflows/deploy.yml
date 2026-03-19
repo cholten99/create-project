@@ -19,6 +19,5 @@ jobs:
           host: ${{ secrets.SFTP_HOST }}
           username: ${{ secrets.SFTP_USERNAME }}
           key: ${{ secrets.SFTP_PRIVATE_KEY }}
-          source: "site/*"
+          source: "*"
           target: "/var/www/<<project-name>>"
-          strip_components: 1

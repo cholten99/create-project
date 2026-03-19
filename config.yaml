@@ -5,4 +5,6 @@ apache_sites_path: /etc/apache2/sites-available
 
 certbot_email: dave@bowsy.co.uk
 
+github_user: cholten99
+
 cloudflare_proxy: true

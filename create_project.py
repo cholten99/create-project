@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from nacl import encoding, public
 
 
-TOTAL_STEPS = 11
+TOTAL_STEPS = 12
 DNS_WAIT_TIMEOUT_SECONDS = 180
 DNS_WAIT_INTERVAL_SECONDS = 10
 
@@ -66,32 +66,67 @@ class StepError(Exception):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create and provision a new static website project."
+        description="""
+Create and provision a new static website project end-to-end.
+
+This script will:
+  1. Validate local project folder does not exist
+  2. Create Cloudflare DNS record (initially unproxied)
+  3. Wait for DNS propagation to the server IP
+  4. Create GitHub repository
+  5. Clone repository locally
+  6. Copy template into repo
+  7. Replace template placeholders
+  8. Set GitHub Actions secrets
+  9. Prepare remote server (Apache config + web root)
+ 10. Run certbot (HTTPS)
+ 11. Enable Cloudflare proxy (if configured)
+ 12. Commit and push to GitHub
+
+Typical usage:
+  create-project mysite mysite.bowsy.co.uk
+  create-project mysite mysite.bowsy.co.uk --dry-run --verbose
+  create-project mysite mysite.bowsy.co.uk --end-step 8
+  create-project mysite mysite.bowsy.co.uk --start-step 9 --end-step 10
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("project_name", help="Short project name, e.g. ukgovcomms")
-    parser.add_argument("project_domain", help="Project domain, e.g. ukgovcomms.org")
+
+    parser.add_argument("project_name", help="Short project name (e.g. mysite)")
+    parser.add_argument("project_domain", help="Full domain (e.g. mysite.bowsy.co.uk)")
+
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print what would happen without making changes",
+        help="Show what would happen without making any changes",
     )
+
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Enable debug logging",
+        help="Enable detailed debug logging",
     )
+
     parser.add_argument(
         "--start-step",
         type=int,
         default=1,
-        help=f"First step to run (default: 1, max: {TOTAL_STEPS})",
+        help=f"First step to run (1–{TOTAL_STEPS})",
     )
+
     parser.add_argument(
         "--end-step",
         type=int,
         default=TOTAL_STEPS,
-        help=f"Last step to run (default: {TOTAL_STEPS})",
+        help=f"Last step to run (1–{TOTAL_STEPS})",
     )
+
+    parser.add_argument(
+        "--help-steps",
+        action="store_true",
+        help="Show detailed description of each step and exit",
+    )
+
     return parser.parse_args()
 
 
@@ -232,6 +267,38 @@ def validate_inputs(runtime: RuntimeConfig) -> None:
 
     if runtime.start_step > runtime.end_step:
         raise StepError("--start-step must be less than or equal to --end-step")
+
+
+def print_step_help() -> None:
+    print(
+        """
+Step 1  - Validate local project folder does not already exist
+Step 2  - Create Cloudflare DNS record (initially unproxied)
+Step 3  - Wait for DNS to resolve to the server IP
+Step 4  - Create GitHub repository
+Step 5  - Clone repository locally
+Step 6  - Copy template into repo
+Step 7  - Replace placeholders in files
+Step 8  - Set GitHub Actions secrets
+Step 9  - Prepare remote server (Apache config, enable site)
+Step 10 - Run certbot to obtain TLS certificate
+Step 11 - Enable Cloudflare proxy (if configured)
+Step 12 - Commit and push to GitHub
+
+Examples:
+  Run everything:
+    create-project mysite mysite.bowsy.co.uk
+
+  Dry run:
+    create-project mysite mysite.bowsy.co.uk --dry-run
+
+  Only GitHub setup:
+    create-project mysite mysite.bowsy.co.uk --end-step 8
+
+  Only server + certbot:
+    create-project mysite mysite.bowsy.co.uk --start-step 9 --end-step 10
+"""
+    )
 
 
 def log_step(step_number: int, message: str) -> None:
@@ -757,10 +824,11 @@ def upsert_cloudflare_a_record(
             expected_statuses=(200,),
         )
         logging.info(
-            "Updated Cloudflare A record for %s in zone %s -> %s",
+            "Updated Cloudflare A record for %s in zone %s -> %s (proxied=%s)",
             domain,
             zone_name,
             target_ip,
+            proxied,
         )
     else:
         cloudflare_request(
@@ -771,16 +839,17 @@ def upsert_cloudflare_a_record(
             expected_statuses=(200,),
         )
         logging.info(
-            "Created Cloudflare A record for %s in zone %s -> %s",
+            "Created Cloudflare A record for %s in zone %s -> %s (proxied=%s)",
             domain,
             zone_name,
             target_ip,
+            proxied,
         )
 
 
 def dig_resolved_ips(domain: str) -> list[str]:
     result = run_command(
-        ["dig", "+short", domain],
+        ["dig", "@1.1.1.1", "+short", domain],
         dry_run=False,
     )
     assert result is not None
@@ -791,7 +860,6 @@ def dig_resolved_ips(domain: str) -> list[str]:
         if not value:
             continue
         if value.endswith("."):
-            # CNAME or other hostname target, not an IP address
             continue
         ips.append(value)
 
@@ -833,27 +901,26 @@ def step_2_create_dns_record(
     env_config: EnvConfig,
     runtime: RuntimeConfig,
 ) -> None:
-    log_step(2, "Create Cloudflare DNS record")
+    log_step(2, "Create Cloudflare DNS record (initially unproxied)")
 
     if runtime.dry_run:
         logging.info(
-            "[DRY RUN] Would create or update Cloudflare A record for %s -> %s (proxied=%s)",
+            "[DRY RUN] Would create or update Cloudflare A record for %s -> %s (proxied=False)",
             runtime.project_domain,
             env_config.server_ip,
-            app_config.cloudflare_proxy,
         )
         return
 
     upsert_cloudflare_a_record(
         runtime.project_domain,
         env_config.server_ip,
-        app_config.cloudflare_proxy,
+        False,
         env_config,
     )
 
 
 def step_3_wait_for_dns(runtime: RuntimeConfig, env_config: EnvConfig) -> None:
-    log_step(3, "Wait for DNS propagation")
+    log_step(3, "Wait for DNS propagation to the server IP")
 
     if runtime.dry_run:
         logging.info(
@@ -1107,11 +1174,38 @@ def step_10_run_certbot(
     logging.info("Certbot completed for %s", runtime.project_domain)
 
 
-def step_11_initial_commit_and_push(
+def step_11_enable_cloudflare_proxy_if_configured(
+    app_config: AppConfig,
+    env_config: EnvConfig,
+    runtime: RuntimeConfig,
+) -> None:
+    log_step(11, "Enable Cloudflare proxy if configured")
+
+    if not app_config.cloudflare_proxy:
+        logging.info("Cloudflare proxy not requested; skipping")
+        return
+
+    if runtime.dry_run:
+        logging.info(
+            "[DRY RUN] Would update Cloudflare A record for %s -> %s (proxied=True)",
+            runtime.project_domain,
+            env_config.server_ip,
+        )
+        return
+
+    upsert_cloudflare_a_record(
+        runtime.project_domain,
+        env_config.server_ip,
+        True,
+        env_config,
+    )
+
+
+def step_12_initial_commit_and_push(
     app_config: AppConfig,
     runtime: RuntimeConfig,
 ) -> None:
-    log_step(11, "Create initial commit and push to GitHub")
+    log_step(12, "Create initial commit and push to GitHub")
 
     target_dir = app_config.local_dev_root / runtime.project_name
 
@@ -1174,13 +1268,19 @@ def build_steps(
         (8, lambda: step_8_set_github_secrets(app_config, env_config, runtime)),
         (9, lambda: step_9_prepare_server(app_config, env_config, runtime)),
         (10, lambda: step_10_run_certbot(app_config, env_config, runtime)),
-        (11, lambda: step_11_initial_commit_and_push(app_config, runtime)),
+        (11, lambda: step_11_enable_cloudflare_proxy_if_configured(app_config, env_config, runtime)),
+        (12, lambda: step_12_initial_commit_and_push(app_config, runtime)),
     ]
 
 
 def main() -> int:
     try:
         args = parse_args()
+
+        if args.help_steps:
+            print_step_help()
+            return 0
+
         configure_logging(args.verbose)
 
         repo_root = Path(__file__).resolve().parent
